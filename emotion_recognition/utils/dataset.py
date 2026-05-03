@@ -115,77 +115,65 @@ class NeuroBioSenseDataset(Dataset):
 
     def _build_signal_cache(self) -> None:
         """Build fast lookup caches so __getitem__ avoids full DataFrame scans."""
-        if self._strict_signal_alignment:
-            p_col = self.signal_id_columns["participant"]
-            a_col = self.signal_id_columns["ad"]
-            assert p_col is not None and a_col is not None
-
-            key_df = self.signal_df[[p_col, a_col] + SIGNAL_COLUMNS].copy()
-            key_df["_pid"] = key_df[p_col].map(normalize_subject_id)
-            key_df["_ad"] = key_df[a_col].map(normalize_ad_code)
-
-            for (pid, ad_code), group in key_df.groupby(["_pid", "_ad"], sort=False):
-                self._signal_by_key[(pid, ad_code)] = group[SIGNAL_COLUMNS].to_numpy(dtype=np.float32)
+        self._signal_by_key = {}
+        if "participant_id" in self.signal_df.columns and "ad_code" in self.signal_df.columns and "video_name" in self.signal_df.columns:
+            for (pid, ad, vid_name), group in self.signal_df.groupby(["participant_id", "ad_code", "video_name"]):
+                key = (normalize_subject_id(pid), normalize_ad_code(ad), str(vid_name))
+                self._signal_by_key[key] = group[SIGNAL_COLUMNS].to_numpy(dtype=np.float32)
+        elif "participant_id" in self.signal_df.columns and "ad_code" in self.signal_df.columns:
+            for (pid, ad), group in self.signal_df.groupby(["participant_id", "ad_code"]):
+                key = (normalize_subject_id(pid), normalize_ad_code(ad), None)
+                self._signal_by_key[key] = group[SIGNAL_COLUMNS].to_numpy(dtype=np.float32)
 
         # Label-agnostic fallback pool when strict keys are unavailable.
         self._signal_global = self.signal_df[SIGNAL_COLUMNS].to_numpy(dtype=np.float32)
 
     @staticmethod
-    def _slice_or_pad(signal_array: np.ndarray, target_len: int, train: bool) -> np.ndarray:
-        """Extract a fixed-length segment, padding with edge samples when needed."""
+    def _slice_or_pad_exact(signal_array: np.ndarray, target_len: int) -> np.ndarray:
+        """Extract a fixed-length segment exactly."""
         n = signal_array.shape[0]
         if n == 0:
             return np.zeros((target_len, len(SIGNAL_COLUMNS)), dtype=np.float32)
 
         if n >= target_len:
-            if train and n > target_len:
-                start = random.randint(0, n - target_len)
-            else:
-                start = max(0, (n - target_len) // 2)
-            return signal_array[start : start + target_len]
+            return signal_array[:target_len]
 
         pad = np.repeat(signal_array[-1:, :], repeats=target_len - n, axis=0)
         return np.concatenate([signal_array, pad], axis=0)
 
-    def _resolve_signal_segment(self, sample: ClipSample, duration_sec: float) -> np.ndarray:
-        """Resolve clip-aligned signal segment.
-
-        Priority:
-        1) strict participant+ad lookup if available in 32-Hertz.csv
-        2) label-agnostic global fallback when keys are unavailable
+    def _resolve_signal_segment(self, sample: ClipSample, start_sec: float, end_sec: float) -> np.ndarray:
+        """Resolve clip-aligned local signal segment accurately matching video context.
+        
+        Zero fallback if strict alignment is missing to avoid feeding random noise logic.
         """
-        target_len = max(1, int(round(duration_sec * 32.0)))
+        target_len = max(1, int(round((end_sec - start_sec) * 32.0)))
 
         if self._strict_signal_alignment:
-            key = (
+            key_exact = (
                 normalize_subject_id(sample.participant_id),
                 normalize_ad_code(sample.ad_code),
+                sample.video_path.name
             )
-            seq = self._signal_by_key.get(key)
+            key_fallback = (
+                normalize_subject_id(sample.participant_id),
+                normalize_ad_code(sample.ad_code),
+                None
+            )
+            
+            seq = self._signal_by_key.get(key_exact)
+            if seq is None:
+                seq = self._signal_by_key.get(key_fallback)
+                
             if seq is not None and len(seq) > 0:
-                return self._slice_or_pad(seq, target_len, train=self.train)
+                start_idx = int(start_sec * 32.0)
+                end_idx = start_idx + target_len
+                
+                if start_idx >= len(seq):
+                    start_idx = max(0, len(seq) - target_len)
+                segment = seq[start_idx:start_idx + target_len]
+                return self._slice_or_pad_exact(segment, target_len)
 
-        # Label-agnostic fallback when strict keys are not present in signal CSV.
-        seq_all = self._signal_global
-        if seq_all is None or len(seq_all) == 0:
-            return np.zeros((target_len, len(SIGNAL_COLUMNS)), dtype=np.float32)
-
-        n = len(seq_all)
-        if n <= target_len:
-            return self._slice_or_pad(seq_all, target_len, train=self.train)
-
-        # WHY hash-based deterministic offset: preserves sample-specific consistency
-        # across epochs/eval while avoiding any direct label leakage.
-        hash_key = f"{sample.participant_id}|{sample.ad_code}|{sample.video_path.name}"
-        base_start = abs(hash(hash_key)) % (n - target_len + 1)
-
-        if self.train:
-            jitter = random.randint(-target_len // 2, target_len // 2)
-            start = int(np.clip(base_start + jitter, 0, n - target_len))
-        else:
-            start = int(base_start)
-
-        return seq_all[start : start + target_len]
+        return np.zeros((target_len, len(SIGNAL_COLUMNS)), dtype=np.float32)
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -194,41 +182,44 @@ class NeuroBioSenseDataset(Dataset):
         sample = self.samples[index]
 
         # Load sampled video frames.
-        frames_tensor, raw_duration_sec = load_video_tensor(
+        frames_tensor, raw_duration_sec, sample_fps = load_video_tensor(
             sample.video_path,
             every_n=self.every_n,
             train=self.train,
             stage=self.stage,
             temporal_jitter=self.train and self.temporal_jitter,
         )
-        # (T, 3, 160, 160)
 
         if self.train:
-            video_window = sample_training_window(frames_tensor, window_size=self.t_v, stride=self.stride)
-            # (T, 3, 160, 160) -> (T_v, 3, 160, 160)
+            video_window, (start_idx, end_idx) = sample_training_window(frames_tensor, window_size=self.t_v, stride=self.stride)
+            
+            start_sec = start_idx / max(1e-5, sample_fps)
+            end_sec = end_idx / max(1e-5, sample_fps)
+            
+            sig_segment = self._resolve_signal_segment(sample, start_sec, end_sec)
+            sig_norm = normalize_signal_np(sig_segment, self.signal_stats)
+            sig_resampled = resample_signal_to_fixed_length(sig_norm, target_length=self.t_s)
+            
+            if self.stage == 3:
+                sig_resampled = augment_signal(sig_resampled)
+                
+            signal_tensor = torch.from_numpy(sig_resampled).float()
         else:
-            windows = make_sliding_windows(frames_tensor, window_size=self.t_v, stride=self.stride)
+            windows, indices = make_sliding_windows(frames_tensor, window_size=self.t_v, stride=self.stride)
             video_window = windows
-            # (N_w, T_v, 3, 160, 160) -> (N_w, T_v, 3, 160, 160)
+            
+            signal_windows = []
+            for (start_idx, end_idx) in indices:
+                start_sec = start_idx / max(1e-5, sample_fps)
+                end_sec = end_idx / max(1e-5, sample_fps)
+                sig_segment = self._resolve_signal_segment(sample, start_sec, end_sec)
+                sig_norm = normalize_signal_np(sig_segment, self.signal_stats)
+                sig_resampled = resample_signal_to_fixed_length(sig_norm, target_length=self.t_s)
+                signal_windows.append(sig_resampled)
+                
+            signal_tensor = torch.from_numpy(np.stack(signal_windows, axis=0)).float()
 
-        duration_sec = lookup_duration(
-            self.duration_df,
-            participant_id=sample.participant_id,
-            ad_code=sample.ad_code,
-            fallback_duration_sec=raw_duration_sec,
-        )
-
-        sig_segment = self._resolve_signal_segment(sample, duration_sec=duration_sec)
-        # (?, 6) aligned by key if available; emotion-conditioned fallback otherwise
-
-        sig_norm = normalize_signal_np(sig_segment, self.signal_stats)  # (?, 6) -> (?, 6)
-        sig_resampled = resample_signal_to_fixed_length(sig_norm, target_length=self.t_s)  # (?,6) -> (T_s,6)
-
-        if self.train and self.stage == 3:
-            sig_resampled = augment_signal(sig_resampled)  # (T_s, 6) -> (T_s, 6)
-
-        signal_tensor = torch.from_numpy(sig_resampled).float()  # (T_s, 6)
-        label_tensor = torch.tensor(sample.label_id, dtype=torch.long)  # ()
+        label_tensor = torch.tensor(sample.label_id, dtype=torch.long)
 
         return video_window, signal_tensor, label_tensor
 

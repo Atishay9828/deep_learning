@@ -58,7 +58,7 @@ def build_video_transform(train: bool = False, stage: int = 3) -> T.Compose:
                 T.Lambda(_ensure_pil),
                 T.Resize((160, 160)),
                 T.RandomHorizontalFlip(p=0.5),
-                T.ColorJitter(brightness=0.2, contrast=0.2),
+                T.ColorJitter(brightness=0.1, contrast=0.1),
                 T.ToTensor(),
                 T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
             ]
@@ -153,6 +153,7 @@ def load_video_tensor(
     Returns:
         frames_tensor: Tensor of shape (T, 3, 160, 160).
         duration_sec: Clip duration in seconds.
+        sample_fps: The effective framerate of the returned frames_tensor.
     """
     path = Path(video_path)
     raw_frames, fps = _read_all_frames(path)
@@ -166,10 +167,11 @@ def load_video_tensor(
     frames_tensor = torch.stack(frame_tensors, dim=0)  # list[(3,160,160)] -> (T, 3, 160, 160)
 
     duration_sec = len(raw_frames) / fps
-    return frames_tensor, duration_sec
+    sample_fps = fps / every_n
+    return frames_tensor, duration_sec, sample_fps
 
 
-def make_sliding_windows(frames_tensor: torch.Tensor, window_size: int = 10, stride: int = 5) -> torch.Tensor:
+def make_sliding_windows(frames_tensor: torch.Tensor, window_size: int = 15, stride: int = 8) -> Tuple[torch.Tensor, List[Tuple[int, int]]]:
     """Create temporal windows from sampled frames.
 
     Args:
@@ -178,7 +180,8 @@ def make_sliding_windows(frames_tensor: torch.Tensor, window_size: int = 10, str
         stride: Sliding window stride.
 
     Returns:
-        Tensor of shape (N_w, window_size, 3, 160, 160).
+        stacked: Tensor of shape (N_w, window_size, 3, 160, 160).
+        indices: List of (start_idx, end_idx) corresponding to each window.
     """
     total_frames = frames_tensor.size(0)
 
@@ -190,26 +193,29 @@ def make_sliding_windows(frames_tensor: torch.Tensor, window_size: int = 10, str
         total_frames = frames_tensor.size(0)
 
     windows = []
+    indices = []
     for start in range(0, max(1, total_frames - window_size + 1), stride):
         end = start + window_size
         if end > total_frames:
             break
         window = frames_tensor[start:end]  # (window_size, 3, 160, 160)
         windows.append(window)
+        indices.append((start, end))
 
     if not windows:
         windows = [frames_tensor[:window_size]]
+        indices = [(0, min(window_size, total_frames))]
 
     stacked = torch.stack(windows, dim=0)  # list[(T_v,3,160,160)] -> (N_w, T_v, 3, 160, 160)
-    return stacked
+    return stacked, indices
 
 
-def sample_training_window(frames_tensor: torch.Tensor, window_size: int = 10, stride: int = 5) -> torch.Tensor:
+def sample_training_window(frames_tensor: torch.Tensor, window_size: int = 15, stride: int = 8) -> Tuple[torch.Tensor, Tuple[int, int]]:
     """Randomly sample one temporal window for Stage 3 training."""
-    windows = make_sliding_windows(frames_tensor, window_size=window_size, stride=stride)
+    windows, indices = make_sliding_windows(frames_tensor, window_size=window_size, stride=stride)
     idx = random.randrange(windows.size(0))
     chosen = windows[idx]  # (N_w, T_v, 3, 160, 160) -> (T_v, 3, 160, 160)
-    return chosen
+    return chosen, indices[idx]
 
 
 def aggregate_window_predictions(window_log_probs: Iterable[torch.Tensor], mode: str = "mean") -> torch.Tensor:

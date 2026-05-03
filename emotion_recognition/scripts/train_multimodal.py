@@ -216,11 +216,12 @@ def summarize_parameter_groups(model: MultimodalEmotionModel) -> Dict[str, int]:
     groups = {
         "face_backbone": model.face_module.backbone,
         "projection_head": model.face_module.projection_head,
-        "face_bilstm": model.face_module.temporal_bilstm,
+        "face_bilstm": model.face_module.temporal_transformer,
         "face_attention": model.face_module.temporal_attention,
         "signal_channel_attention": model.signal_module.channel_attention,
         "signal_cnn": model.signal_module.cnn_blocks,
-        "signal_bilstm": model.signal_module.bilstm,
+        "signal_proj": model.signal_module.sig_proj,
+        "signal_bilstm": model.signal_module.temporal_transformer,
         "signal_attention": model.signal_module.temporal_attention,
         "cross_modal_attention": model.cross_modal_attention,
         "fusion": model.fusion,
@@ -258,7 +259,8 @@ def build_optimizer(model: MultimodalEmotionModel) -> Adam:
 
     # Signal stack uses conservative LR when trainable.
     groups.append({"params": [p for p in model.signal_module.cnn_blocks.parameters() if p.requires_grad], "lr": 1e-4})
-    groups.append({"params": [p for p in model.signal_module.bilstm.parameters() if p.requires_grad], "lr": 1e-4})
+    groups.append({"params": [p for p in model.signal_module.sig_proj.parameters() if p.requires_grad], "lr": 1e-4})
+    groups.append({"params": [p for p in model.signal_module.temporal_transformer.parameters() if p.requires_grad], "lr": 1e-4})
     groups.append({"params": [p for p in model.signal_module.temporal_attention.parameters() if p.requires_grad], "lr": 1e-4})
 
     # Optional trainable signal channel-attention also with conservative lr.
@@ -270,11 +272,11 @@ def build_optimizer(model: MultimodalEmotionModel) -> Adam:
     groups.append({"params": [p for p in model.classifier.parameters() if p.requires_grad], "lr": 1e-3})
 
     # Face temporal dynamics beyond projection also use lr=1e-3.
-    groups.append({"params": [p for p in model.face_module.temporal_bilstm.parameters() if p.requires_grad], "lr": 1e-3})
+    groups.append({"params": [p for p in model.face_module.temporal_transformer.parameters() if p.requires_grad], "lr": 1e-3})
     groups.append({"params": [p for p in model.face_module.temporal_attention.parameters() if p.requires_grad], "lr": 1e-3})
 
     filtered_groups = [g for g in groups if len(g["params"]) > 0]
-    optimizer = Adam(filtered_groups)
+    optimizer = Adam(filtered_groups, foreach=False)
     return optimizer
 
 
@@ -304,13 +306,19 @@ def run_epoch(
             labels = labels.to(device, non_blocking=True)  # (B,)
 
             optimizer.zero_grad(set_to_none=True)
-            log_probs, _ = model(
+            log_probs, val_log_probs, _ = model(
                 video,
                 signal,
                 use_face=not disable_face,
                 use_signal=not disable_signal,
-            )  # ((B,T_v,3,160,160),(B,T_s,6)) -> (B,7)
-            loss = criterion(log_probs, labels)
+            )
+            loss_emo = criterion(log_probs, labels)
+            if num_classes == 7:
+                v_map = [VALENCE3_MAP[int(l)] if int(l) in VALENCE3_MAP else 1 for l in labels]
+                loss_val = torch.nn.functional.nll_loss(val_log_probs, torch.tensor(v_map, device=device))
+                loss = loss_emo + 0.3 * loss_val
+            else:
+                loss = loss_emo
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -322,25 +330,32 @@ def run_epoch(
             y_pred.extend(preds.detach().cpu().tolist())
         else:
             # Expected eval shapes with batch_size=1:
-            # video: (1, N_w, T_v, 3, 160, 160), signal: (1, T_s, 6), labels: (1,)
+            # video: (1, N_w, T_v, 3, 160, 160), signal: (1, N_w, T_s, 6), labels: (1,)
             clip_windows = video.squeeze(0).to(device, non_blocking=True)  # (1,N_w,T_v,3,160,160) -> (N_w,T_v,3,160,160)
-            clip_signal = signal.squeeze(0).to(device, non_blocking=True)  # (1,T_s,6) -> (T_s,6)
+            clip_signal = signal.squeeze(0).to(device, non_blocking=True)  # (1,N_w,T_s,6) -> (N_w,T_s,6)
             clip_label = labels.squeeze(0).to(device, non_blocking=True)  # (1,) -> ()
 
             if disable_face:
                 clip_windows = clip_windows[:1]
+                clip_signal = clip_signal[:1]
 
             n_w = clip_windows.size(0)
-            signal_rep = clip_signal.unsqueeze(0).repeat(n_w, 1, 1)  # (T_s,6) -> (N_w,T_s,6)
+            signal_rep = clip_signal
             if disable_signal:
                 signal_rep = torch.zeros_like(signal_rep)
 
-            window_log_probs, _ = model(
-                clip_windows,
-                signal_rep,
-                use_face=not disable_face,
-                use_signal=not disable_signal,
-            )  # ((N_w,T_v,3,160,160),(N_w,T_s,6)) -> (N_w,7)
+            w_logs = []
+            v_logs = []
+            chunk_size = 4
+            for i in range(0, clip_windows.size(0), chunk_size):
+                cw = clip_windows[i:i+chunk_size]
+                sw = signal_rep[i:i+chunk_size]
+                wl, vl, _ = model(cw, sw, use_face=not disable_face, use_signal=not disable_signal)
+                w_logs.append(wl)
+                v_logs.append(vl)
+            
+            window_log_probs = torch.cat(w_logs, dim=0)
+            window_val_log_probs = torch.cat(v_logs, dim=0)
 
             if aggregation_mode == "majority":
                 votes = window_log_probs.argmax(dim=1)  # (N_w,7) -> (N_w,)
@@ -349,10 +364,17 @@ def run_epoch(
                 agg_log_probs = torch.log(agg_probs).unsqueeze(0)  # (7,) -> (1,7)
             else:
                 agg_probs = torch.exp(window_log_probs).mean(dim=0).clamp_min(1e-9)  # (N_w,7) -> (7,)
-                agg_log_probs = torch.log(agg_probs).unsqueeze(0)  # (7,) -> (1,7)
+                agg_log_probs = torch.log(agg_probs).unsqueeze(0)  # (1,7)
 
             label_batch = clip_label.view(1)  # () -> (1,)
-            loss = criterion(agg_log_probs, label_batch)
+            loss_emo = criterion(agg_log_probs, label_batch)
+            if num_classes == 7:
+                v_map = VALENCE3_MAP[int(label_batch.item())] if int(label_batch.item()) in VALENCE3_MAP else 1
+                val_mean = window_val_log_probs.mean(dim=0).unsqueeze(0)
+                loss_val = torch.nn.functional.nll_loss(val_mean, torch.tensor([v_map], device=device))
+                loss = loss_emo + 0.3 * loss_val
+            else:
+                loss = loss_emo
             losses.append(float(loss.item()))
 
             pred = agg_log_probs.argmax(dim=1)  # (1,7) -> (1,)
@@ -390,14 +412,17 @@ def maybe_load_pretrained_weights(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Stage 3 multimodal fine-tuning on NeuroBioSense")
-    parser.add_argument("--dataset-root", type=str, default="Dataset")
+    parser.add_argument("--unfreeze-backbone", action="store_true", help="Unfreeze FaceNet blocks")
+    parser.add_argument("--disable-face", action="store_true", help="Disable visual CNN")
+    parser.add_argument("--dataset-root", type=str, default=".")
     parser.add_argument("--video-root", type=str, default="")
     parser.add_argument("--signal-csv", type=str, default="")
     parser.add_argument("--demographics-csv", type=str, default="")
     parser.add_argument("--facenet-stage1", type=str, default="facenet_stage1.pth")
     parser.add_argument("--signal-stage2", type=str, default="signal_stage2.pth")
-    parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output", type=str, default="multimodal_stage3.pth")
@@ -434,11 +459,6 @@ def parse_args() -> argparse.Namespace:
         "--freeze-face-all",
         action="store_true",
         help="Freeze full face branch during Stage 3.",
-    )
-    parser.add_argument(
-        "--disable-face",
-        action="store_true",
-        help="Bypass face branch and use zero face embeddings (signal-only ablation).",
     )
     parser.add_argument(
         "--freeze-signal-all",
@@ -499,14 +519,23 @@ def main() -> None:
             args.augment_repeats = 4
 
     if args.device == "mps" and not torch.backends.mps.is_available():
-        device = torch.device("cpu")
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+        else:
+            try:
+                import torch_directml
+                device = torch_directml.device()
+                print("Activated DirectML Acceleration (Intel ARC / Windows Native GPU)")
+            except:
+                device = torch.device("cpu")
+                print("Falling back to CPU - no CUDA or DirectML found.")
     else:
         device = torch.device(args.device)
 
     dataset_root = Path(args.dataset_root)
-    default_video_root = dataset_root / "NeuroBioSense Dataset" / "NeuroBioSense" / "Advertisement Categories"
-    default_signal_csv = dataset_root / "NeuroBioSense Dataset" / "NeuroBioSense" / "Biosignal Files" / "Pre-Processed" / "32-Hertz.csv"
-    default_demo_xlsx = dataset_root / "NeuroBioSense Dataset" / "NeuroBioSense" / "Participant Data" / "Participant_demographic_information.xlsx"
+    default_video_root = dataset_root / "NeuroBioSense" / "Advertisement Categories"
+    default_signal_csv = dataset_root / "NeuroBioSense" / "Biosignal Files" / "Pre-Processed" / "Mapped-32-Hertz.csv"
+    default_demo_xlsx = dataset_root / "NeuroBioSense" / "Participant Data" / "Participant_demographic_information.xlsx"
 
     video_root = Path(args.video_root) if args.video_root else default_video_root
     signal_csv_path = Path(args.signal_csv) if args.signal_csv else default_signal_csv
@@ -526,8 +555,8 @@ def main() -> None:
         signal_csv_path=signal_csv_path,
         demographics_csv_path=demographics_path,
         stage=3,
-        t_v=10,
-        t_s=128,
+        t_v=15,
+        t_s=64,
         seed=args.seed,
     )
 
@@ -585,10 +614,14 @@ def main() -> None:
         pin_memory=True,
     )
 
-    model = MultimodalEmotionModel(num_classes=num_classes).to(device)
+    model = MultimodalEmotionModel(num_classes=num_classes)
+    model.apply_stage3_freezing(unfreeze_backbone=args.unfreeze_backbone)
+    model.to(device)
     maybe_load_pretrained_weights(model, args.facenet_stage1, args.signal_stage2)
 
     # Stage-specific freezing policy.
+    # We call it again AFTER loading weights to ensure freeze state is maintained
+    model.apply_stage3_freezing(unfreeze_backbone=args.unfreeze_backbone)
     if args.disable_face or args.freeze_face_all:
         for p in model.face_module.parameters():
             p.requires_grad = False
@@ -600,7 +633,7 @@ def main() -> None:
         # FaceNet remains mostly frozen; optionally adapt the top representation block.
         model.face_module.backbone.freeze_all()
     else:
-        model.apply_stage3_freezing()
+        model.apply_stage3_freezing(unfreeze_backbone=args.unfreeze_backbone)
 
     if args.unfreeze_face_last_block and not (args.disable_face or args.freeze_face_all):
         model.face_module.backbone.unfreeze_last_inception_block()
@@ -628,8 +661,13 @@ def main() -> None:
     else:
         criterion = LabelSmoothingNLLLoss(class_weights=criterion_weights, smoothing=args.label_smoothing)
 
-    optimizer = build_optimizer(model)
-    scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
+    optimizer = torch.optim.Adam(
+        filter(lambda p: p.requires_grad, list(model.parameters())),
+        lr=args.lr,
+    )
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='max', factor=0.5, patience=2
+    )
 
     best_f1 = -1.0
     best_state = None
@@ -661,7 +699,7 @@ def main() -> None:
             disable_face=args.disable_face,
             disable_signal=args.disable_signal,
         )
-        scheduler.step()
+        scheduler.step(val_metrics['macro_f1'])
 
         print(
             f"[Stage3][Epoch {epoch:03d}] "

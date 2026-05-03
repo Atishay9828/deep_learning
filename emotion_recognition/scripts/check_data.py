@@ -19,7 +19,7 @@ from emotion_recognition.utils.signal_processing import infer_id_columns, load_3
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Check NeuroBioSense dataset readiness")
-    parser.add_argument("--dataset-root", type=str, default="Dataset")
+    parser.add_argument("--dataset-root", type=str, default=".")
     parser.add_argument("--video-root", type=str, default="")
     parser.add_argument("--signal-csv", type=str, default="")
     parser.add_argument("--demographics", type=str, default="")
@@ -33,17 +33,17 @@ def main() -> None:
     video_root = (
         Path(args.video_root)
         if args.video_root
-        else dataset_root / "NeuroBioSense Dataset" / "NeuroBioSense" / "Advertisement Categories"
+        else dataset_root / "NeuroBioSense" / "Advertisement Categories"
     )
     signal_csv = (
         Path(args.signal_csv)
         if args.signal_csv
-        else dataset_root / "NeuroBioSense Dataset" / "NeuroBioSense" / "Biosignal Files" / "Pre-Processed" / "32-Hertz.csv"
+        else dataset_root / "NeuroBioSense" / "Biosignal Files" / "Pre-Processed" / "Mapped-32-Hertz.csv"
     )
     demographics = (
         Path(args.demographics)
         if args.demographics
-        else dataset_root / "NeuroBioSense Dataset" / "NeuroBioSense" / "Participant Data" / "Participant_demographic_information.xlsx"
+        else dataset_root / "NeuroBioSense" / "Participant Data" / "Participant_demographic_information.xlsx"
     )
 
     print(f"Video root      : {video_root}")

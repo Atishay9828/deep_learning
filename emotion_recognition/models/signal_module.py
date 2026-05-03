@@ -11,7 +11,7 @@ from typing import Tuple
 import torch
 import torch.nn as nn
 
-from .attention_module import TemporalAttentionPool
+from .attention_module import TemporalAttentionPool, PositionalEncoding
 
 
 class ChannelAttention(nn.Module):
@@ -84,16 +84,12 @@ class SignalModule(nn.Module):
         self.channel_attention = ChannelAttention(channels=channels)
         self.cnn_blocks = SignalCNNBlocks(in_channels=channels)
 
-        # WHY bidirectional + 2 layers: physiology trends evolve over time,
-        # and deeper recurrent capacity helps disambiguate subtle affect cues.
-        self.bilstm = nn.LSTM(
-            input_size=64,
-            hidden_size=128,
-            num_layers=2,
-            batch_first=True,
-            bidirectional=True,
-            dropout=0.3,
-        )
+        # WHY Transformer: highly effective mapping from CNN kernels into
+        # deep temporal representation.
+        self.sig_proj = nn.Linear(64, 256)
+        self.pos_encoder = PositionalEncoding(d_model=256)
+        encoder_layer = nn.TransformerEncoderLayer(d_model=256, nhead=8, dim_feedforward=512, batch_first=True)
+        self.temporal_transformer = nn.TransformerEncoder(encoder_layer, num_layers=2)
         self.temporal_attention = TemporalAttentionPool(input_dim=256)
 
     def forward(self, signal: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -109,9 +105,13 @@ class SignalModule(nn.Module):
         """
         attended = self.channel_attention(signal)  # (B, T_s, 6) -> (B, T_s, 6)
         cnn_out = self.cnn_blocks(attended)  # (B, T_s, 6) -> (B, T_s//4, 64)
-        lstm_out, _ = self.bilstm(cnn_out)  # (B, T_s//4, 64) -> (B, T_s//4, 256)
-        sig_emb, attn_weights = self.temporal_attention(lstm_out)  # (B, T_s//4, 256) -> (B, 256), (B, T_s//4)
-        return sig_emb, lstm_out, attn_weights
+        
+        proj_out = self.sig_proj(cnn_out) # (B, T_s//4, 256)
+        proj_out_pos = self.pos_encoder(proj_out)
+        transformer_out = self.temporal_transformer(proj_out_pos)  # -> (B, T_s//4, 256)
+        
+        sig_emb, attn_weights = self.temporal_attention(transformer_out)  # (B, T_s//4, 256) -> (B, 256), (B, T_s//4)
+        return sig_emb, transformer_out, attn_weights
 
     def freeze_cnn_blocks(self) -> None:
         """Freeze only convolutional blocks for Stage 3 fine-tuning."""
@@ -123,7 +123,9 @@ class SignalModule(nn.Module):
         self.freeze_cnn_blocks()
         for param in self.channel_attention.parameters():
             param.requires_grad = True
-        for param in self.bilstm.parameters():
+        for param in self.sig_proj.parameters():
+            param.requires_grad = True
+        for param in self.temporal_transformer.parameters():
             param.requires_grad = True
         for param in self.temporal_attention.parameters():
             param.requires_grad = True

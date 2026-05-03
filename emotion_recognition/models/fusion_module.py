@@ -15,8 +15,9 @@ import torch.nn as nn
 class SoftGatingFusion(nn.Module):
     """Per-dimension soft gating over projected modality embeddings."""
 
-    def __init__(self, vid_dim: int = 128, sig_dim: int = 256, fused_dim: int = 384) -> None:
+    def __init__(self, vid_dim: int = 128, sig_dim: int = 256, fused_dim: int = 384, modality_dropout: float = 0.15) -> None:
         super().__init__()
+        self.modality_dropout = modality_dropout
         self.proj_vid = nn.Linear(vid_dim, fused_dim)
         self.proj_sig = nn.Linear(sig_dim, fused_dim)
         self.gate = nn.Sequential(
@@ -40,6 +41,13 @@ class SoftGatingFusion(nn.Module):
 
         proj_vid = self.proj_vid(enhanced_vid)  # (B, 128) -> (B, 384)
         proj_sig = self.proj_sig(enhanced_sig)  # (B, 256) -> (B, 384)
+
+        # Modality Dropout (Masked Fusion)
+        if self.training and self.modality_dropout > 0:
+            mask_vid = (torch.rand(enhanced_vid.shape[0], 1, device=enhanced_vid.device) > self.modality_dropout).float()
+            mask_sig = (torch.rand(enhanced_sig.shape[0], 1, device=enhanced_sig.device) > self.modality_dropout).float()
+            proj_vid = proj_vid * mask_vid
+            proj_sig = proj_sig * mask_sig
 
         # WHY gated interpolation: suppresses unreliable modality features instead
         # of hard-discarding an entire stream.

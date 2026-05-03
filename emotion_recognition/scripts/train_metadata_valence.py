@@ -44,7 +44,7 @@ class MetadataRow:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train metadata-assisted binary valence baseline")
-    parser.add_argument("--dataset-root", type=str, default="Dataset")
+    parser.add_argument("--dataset-root", type=str, default=".")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--oversample-minority", action="store_true", help="Apply random oversampling to minority class")
     parser.add_argument("--skip-val-tuning", action="store_true", help="Use provided hyperparameters directly")
@@ -162,7 +162,7 @@ def main() -> None:
     args = parse_args()
 
     dataset_root = Path(args.dataset_root)
-    video_root = dataset_root / "NeuroBioSense Dataset" / "NeuroBioSense" / "Advertisement Categories"
+    video_root = dataset_root / "NeuroBioSense" / "Advertisement Categories"
 
     all_samples = scan_video_samples(video_root)
     train_ids, val_ids, test_ids = split_participants(all_samples, test_size=0.15, val_size=0.15, seed=args.seed)
