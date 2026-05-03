@@ -42,7 +42,7 @@ cells.append(code("""\
 cells.append(code("""\
     REPO = Path('/kaggle/working/repo')
     if not REPO.exists():
-        os.system('git clone https://github.com/HaryiankKumra/NeuroBioSense_DL_Proj.git '+str(REPO))
+        os.system('git clone https://github.com/Atishay9828/deep_learning.git '+str(REPO))
     sys.path.insert(0, str(REPO))
     os.chdir(str(REPO))
     print("✅ Repo ready")"""))
