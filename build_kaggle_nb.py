@@ -24,8 +24,7 @@ cells.append(md("""\
 cells.append(code("""\
     import os, sys, time, warnings, shutil
     warnings.filterwarnings('ignore')
-    os.system('pip install -q facenet-pytorch --no-deps')
-    os.system('pip install -q neurokit2 seaborn openpyxl')
+    os.system('pip install -q facenet-pytorch neurokit2 seaborn openpyxl')
     import torch, numpy as np, pandas as pd
     import matplotlib.pyplot as plt, seaborn as sns
     import cv2

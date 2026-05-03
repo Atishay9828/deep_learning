@@ -1,10 +1,13 @@
 """Face stream module for multimodal emotion recognition.
 
+Architecture: FaceNet -> Projection -> BiLSTM -> Transformer -> AttentionPool
+
 Pipeline:
-1) Shared FaceNet backbone over each frame
+1) Shared FaceNet backbone over each frame -> 512-d embeddings
 2) Projection to compact 128-d frame tokens
-3) Temporal BiLSTM over frame tokens
-4) Attention pooling to focus on highly expressive moments
+3) BiLSTM for local temporal dynamics (micro-expressions)
+4) Transformer for global temporal attention
+5) Attention pooling to focus on highly expressive moments
 """
 
 from __future__ import annotations
@@ -20,7 +23,7 @@ from .projection_head import ProjectionHead
 
 
 class FaceModule(nn.Module):
-    """Video encoder returning frame-level and clip-level embeddings."""
+    """Video encoder with hybrid BiLSTM-Transformer temporal modeling."""
 
     def __init__(
         self,
@@ -31,12 +34,27 @@ class FaceModule(nn.Module):
         self.backbone = backbone if backbone is not None else FaceNetBackbone(pretrained="vggface2")
         self.projection_head = projection_head if projection_head is not None else ProjectionHead()
 
-        # WHY Transformer: completely parallel temporal encoding captures highly
-        # non-linear and non-causal emotion dynamics better than memory gating.
+        # WHY BiLSTM before Transformer: micro-expressions are inherently
+        # sequential (onset -> apex -> offset). BiLSTM captures this
+        # ordered temporal structure that position-invariant Transformer
+        # attention may overlook.
+        self.bilstm = nn.LSTM(
+            input_size=128,
+            hidden_size=64,
+            num_layers=1,
+            batch_first=True,
+            bidirectional=True,
+            dropout=0.0,
+        )
+        self.lstm_norm = nn.LayerNorm(128)
+
+        # WHY Transformer after BiLSTM: operates on BiLSTM-enriched
+        # features to capture global dependencies (e.g., emotional build-up
+        # across non-adjacent frames).
         self.pos_encoder = PositionalEncoding(d_model=128)
         encoder_layer = nn.TransformerEncoderLayer(d_model=128, nhead=4, dim_feedforward=256, batch_first=True)
         self.temporal_transformer = nn.TransformerEncoder(encoder_layer, num_layers=2)
-        
+
         self.temporal_attention = TemporalAttentionPool(input_dim=128)
 
     def forward(self, video: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -52,14 +70,20 @@ class FaceModule(nn.Module):
         """
         bsz, t_v, channels, height, width = video.shape
 
-        frames = video.reshape(bsz * t_v, channels, height, width)  # (B, T_v, 3, 160, 160) -> (B*T_v, 3, 160, 160)
-        face_512 = self.backbone(frames)  # (B*T_v, 3, 160, 160) -> (B*T_v, 512)
-        proj_128 = self.projection_head(face_512)  # (B*T_v, 512) -> (B*T_v, 128)
-        frame_emb = proj_128.reshape(bsz, t_v, 128)  # (B*T_v, 128) -> (B, T_v, 128)
+        frames = video.reshape(bsz * t_v, channels, height, width)  # (B*T_v, 3, 160, 160)
+        face_512 = self.backbone(frames)           # (B*T_v, 512)
+        proj_128 = self.projection_head(face_512)  # (B*T_v, 128)
+        frame_emb = proj_128.reshape(bsz, t_v, 128)  # (B, T_v, 128)
 
-        frame_emb_pos = self.pos_encoder(frame_emb)
-        transformer_out = self.temporal_transformer(frame_emb_pos)  # (B, T_v, 128) -> (B, T_v, 128)
-        vid_emb, attn_weights = self.temporal_attention(transformer_out)  # (B, T_v, 128) -> (B, 128), (B, T_v)
+        # BiLSTM for local sequential encoding of expression dynamics
+        lstm_out, _ = self.bilstm(frame_emb)       # (B, T_v, 128)
+        lstm_out = self.lstm_norm(lstm_out + frame_emb)  # residual + norm
+
+        # Transformer for global temporal attention
+        pos_encoded = self.pos_encoder(lstm_out)
+        transformer_out = self.temporal_transformer(pos_encoded)  # (B, T_v, 128)
+
+        vid_emb, attn_weights = self.temporal_attention(transformer_out)
 
         return frame_emb, vid_emb, attn_weights
 
@@ -67,6 +91,10 @@ class FaceModule(nn.Module):
         """Stage 3 policy: frozen FaceNet backbone, trainable temporal head."""
         self.backbone.set_stage3_policy()
         for param in self.projection_head.parameters():
+            param.requires_grad = True
+        for param in self.bilstm.parameters():
+            param.requires_grad = True
+        for param in self.lstm_norm.parameters():
             param.requires_grad = True
         for param in self.temporal_transformer.parameters():
             param.requires_grad = True

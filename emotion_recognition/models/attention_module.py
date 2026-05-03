@@ -1,8 +1,10 @@
 """Attention modules used by face, signal, and fusion pipelines.
 
 Includes:
+- PositionalEncoding for Transformer layers
 - TemporalAttentionPool for sequence compression
-- CrossModalAttention for bidirectional video-signal refinement
+- CrossModalAttention for bidirectional video-signal refinement (pooled)
+- SequenceCrossModalAttention for temporal cross-modal attention (sequence-level)
 """
 
 from __future__ import annotations
@@ -115,5 +117,105 @@ class CrossModalAttention(nn.Module):
         sig_base = self.sig_residual_proj(sig_emb)  # (B, 256) -> (B, 128)
         enhanced_sig_128 = sig_base + attn_sig.squeeze(1)  # (B, 128) + (B, 128) -> (B, 128)
         enhanced_sig = self.sig_back_proj(enhanced_sig_128)  # (B, 128) -> (B, 256)
+
+        return enhanced_vid, enhanced_sig
+
+
+class SequenceCrossModalAttention(nn.Module):
+    """Temporal sequence-level cross-modal attention.
+
+    WHY sequence-level: Unlike pooled cross-attention which operates on
+    single summary vectors, this module lets each time step in one modality
+    attend to ALL time steps in the other. This captures fine-grained
+    temporal correspondences (e.g., a facial micro-expression at t=3
+    correlating with an EDA spike at t=5).
+    """
+
+    def __init__(self, vid_dim: int = 128, sig_dim: int = 256, attn_dim: int = 128, num_heads: int = 4) -> None:
+        super().__init__()
+        self.attn_dim = attn_dim
+        self.num_heads = num_heads
+        self.head_dim = attn_dim // num_heads
+        self.scale = sqrt(self.head_dim)
+
+        # Video queries signal sequence
+        self.vid_to_q = nn.Linear(vid_dim, attn_dim)
+        self.sig_to_kv = nn.Linear(sig_dim, attn_dim * 2)
+        self.vid_out_proj = nn.Linear(attn_dim, vid_dim)
+        self.vid_norm = nn.LayerNorm(vid_dim)
+
+        # Signal queries video sequence
+        self.sig_to_q = nn.Linear(sig_dim, attn_dim)
+        self.vid_to_kv = nn.Linear(vid_dim, attn_dim * 2)
+        self.sig_out_proj = nn.Linear(attn_dim, sig_dim)
+        self.sig_norm = nn.LayerNorm(sig_dim)
+
+        self.dropout = nn.Dropout(0.1)
+
+    def _multi_head_attn(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        """Multi-head attention helper.
+
+        Args:
+            q: (B, T_q, attn_dim)
+            k: (B, T_k, attn_dim)
+            v: (B, T_k, attn_dim)
+
+        Returns:
+            (B, T_q, attn_dim)
+        """
+        B, T_q, _ = q.shape
+        T_k = k.shape[1]
+
+        # Reshape to multi-head: (B, T, D) -> (B, H, T, D_h)
+        q = q.view(B, T_q, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, T_k, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, T_k, self.num_heads, self.head_dim).transpose(1, 2)
+
+        # Scaled dot-product attention
+        scores = torch.matmul(q, k.transpose(-2, -1)) / self.scale  # (B, H, T_q, T_k)
+        attn = torch.softmax(scores, dim=-1)
+        attn = self.dropout(attn)
+        out = torch.matmul(attn, v)  # (B, H, T_q, D_h)
+
+        # Merge heads
+        out = out.transpose(1, 2).contiguous().view(B, T_q, self.attn_dim)
+        return out
+
+    def forward(
+        self,
+        vid_seq: torch.Tensor,
+        sig_seq: torch.Tensor,
+        vid_emb: torch.Tensor,
+        sig_emb: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Run bidirectional sequence-level cross-modal attention.
+
+        Args:
+            vid_seq: Video temporal features (B, T_v, 128).
+            sig_seq: Signal temporal features (B, T_s, 256).
+            vid_emb: Pooled video embedding (B, 128) - used as fallback residual.
+            sig_emb: Pooled signal embedding (B, 256) - used as fallback residual.
+
+        Returns:
+            enhanced_vid: (B, 128).
+            enhanced_sig: (B, 256).
+        """
+        # Video queries signal: each video frame attends to all signal steps
+        q_vid = self.vid_to_q(vid_seq)                    # (B, T_v, attn_dim)
+        kv_sig = self.sig_to_kv(sig_seq)                  # (B, T_s, attn_dim*2)
+        k_sig, v_sig = kv_sig.chunk(2, dim=-1)            # each (B, T_s, attn_dim)
+        vid_cross = self._multi_head_attn(q_vid, k_sig, v_sig)  # (B, T_v, attn_dim)
+        vid_cross = self.vid_out_proj(vid_cross)           # (B, T_v, vid_dim)
+        vid_enhanced_seq = self.vid_norm(vid_seq + vid_cross)    # residual
+        enhanced_vid = vid_enhanced_seq.mean(dim=1)        # (B, vid_dim) global pool
+
+        # Signal queries video: each signal step attends to all video frames
+        q_sig = self.sig_to_q(sig_seq)                    # (B, T_s, attn_dim)
+        kv_vid = self.vid_to_kv(vid_seq)                  # (B, T_v, attn_dim*2)
+        k_vid, v_vid = kv_vid.chunk(2, dim=-1)            # each (B, T_v, attn_dim)
+        sig_cross = self._multi_head_attn(q_sig, k_vid, v_vid)  # (B, T_s, attn_dim)
+        sig_cross = self.sig_out_proj(sig_cross)           # (B, T_s, sig_dim)
+        sig_enhanced_seq = self.sig_norm(sig_seq + sig_cross)    # residual
+        enhanced_sig = sig_enhanced_seq.mean(dim=1)        # (B, sig_dim) global pool
 
         return enhanced_vid, enhanced_sig

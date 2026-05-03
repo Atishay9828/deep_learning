@@ -1,11 +1,16 @@
 """End-to-end multimodal emotion recognition model.
 
 This module assembles:
-- Face pipeline (FaceNet + projection + temporal BiLSTM + temporal attention)
-- Signal pipeline (channel attention + CNN + BiLSTM + temporal attention)
-- Cross-modal attention
+- Face pipeline (FaceNet + projection + BiLSTM + Transformer + attention pool)
+- Signal pipeline (channel attention + Multi-Scale CNN + BiLSTM + Transformer + attention pool)
+- Sequence-level cross-modal attention (temporal, not just pooled)
 - Soft-gating fusion
 - Final classifier
+
+Architectural contributions beyond baseline:
+1. Hybrid BiLSTM-Transformer in both face and signal modules
+2. Multi-scale inception-style CNN for physiological signals
+3. Sequence-level bidirectional cross-modal attention with multi-head support
 """
 
 from __future__ import annotations
@@ -15,7 +20,7 @@ from typing import Tuple
 import torch
 import torch.nn as nn
 
-from .attention_module import CrossModalAttention
+from .attention_module import SequenceCrossModalAttention
 from .classifier import EmotionClassifier
 from .face_module import FaceModule
 from .fusion_module import SoftGatingFusion
@@ -29,8 +34,12 @@ class MultimodalEmotionModel(nn.Module):
         super().__init__()
         self.num_classes = int(num_classes)
         self.face_module = FaceModule()
-        self.signal_module = SignalModule(channels=6)
-        self.cross_modal_attention = CrossModalAttention(vid_dim=128, sig_dim=256, attn_dim=128)
+        self.signal_module = SignalModule(channels=6, use_multiscale=True)
+        # WHY sequence-level: allows each video frame to attend to each
+        # signal time step, capturing fine-grained temporal correspondences.
+        self.cross_modal_attention = SequenceCrossModalAttention(
+            vid_dim=128, sig_dim=256, attn_dim=128, num_heads=4
+        )
         self.fusion = SoftGatingFusion(vid_dim=128, sig_dim=256, fused_dim=384)
         self.classifier = EmotionClassifier(input_dim=384, num_classes=self.num_classes)
 
@@ -53,8 +62,8 @@ class MultimodalEmotionModel(nn.Module):
         Args:
             video: Tensor of shape (B, T_v, 3, 160, 160).
             signal: Tensor of shape (B, T_s, 6).
-            use_face: Whether to execute face branch (False uses zero face embeddings).
-            use_signal: Whether to execute signal branch (False uses zero signal embeddings).
+            use_face: Whether to execute face branch.
+            use_signal: Whether to execute signal branch.
 
         Returns:
             output: Log-probabilities tensor of shape (B, C).
@@ -64,30 +73,31 @@ class MultimodalEmotionModel(nn.Module):
         bsz, t_v = video.shape[0], video.shape[1]
 
         if use_face:
-            facenet_emb, vid_emb, _ = self.face_module(video)  # (B, T_v, 3, 160, 160) -> (B, T_v, 128), (B, 128)
-            assert facenet_emb.shape == (bsz, t_v, 128), f"Expected {(bsz, t_v, 128)}, got {tuple(facenet_emb.shape)}"
+            facenet_emb, vid_emb, _ = self.face_module(video)
+            vid_seq = facenet_emb  # (B, T_v, 128) temporal sequence
         else:
-            facenet_emb = torch.zeros((bsz, t_v, 128), device=video.device, dtype=video.dtype)
+            vid_seq = torch.zeros((bsz, t_v, 128), device=video.device, dtype=video.dtype)
             vid_emb = torch.zeros((bsz, 128), device=video.device, dtype=video.dtype)
 
         if use_signal:
-            sig_emb, _, _ = self.signal_module(signal)  # (B, T_s, 6) -> (B, 256)
+            sig_emb, sig_seq, _ = self.signal_module(signal)
+            # sig_seq: (B, T_s//4, 256) temporal sequence
         else:
             sig_emb = torch.zeros((bsz, 256), device=video.device, dtype=video.dtype)
+            sig_seq = torch.zeros((bsz, 1, 256), device=video.device, dtype=video.dtype)
 
-        assert vid_emb.shape == (bsz, 128), f"Expected {(bsz, 128)}, got {tuple(vid_emb.shape)}"
-        assert sig_emb.shape == (bsz, 256), f"Expected {(bsz, 256)}, got {tuple(sig_emb.shape)}"
+        # Sequence-level cross-modal attention: each modality's time steps
+        # attend to all time steps of the other modality
+        enhanced_vid, enhanced_sig = self.cross_modal_attention(
+            vid_seq, sig_seq, vid_emb, sig_emb
+        )
 
-        enhanced_vid, enhanced_sig = self.cross_modal_attention(vid_emb, sig_emb)  # (B, 128), (B, 256) -> (B, 128), (B, 256)
-        fused, _ = self.fusion(enhanced_vid, enhanced_sig)  # (B, 128)+(B, 256) -> (B, 384)
-        assert fused.shape == (bsz, 384), f"Expected {(bsz, 384)}, got {tuple(fused.shape)}"
+        fused, _ = self.fusion(enhanced_vid, enhanced_sig)
 
-        output, val_output = self.classifier(fused)  # (B, 384) -> (B, C), (B, 3)
-        assert output.shape == (bsz, self.num_classes), f"Expected {(bsz, self.num_classes)}, got {tuple(output.shape)}"
-        assert val_output.shape == (bsz, 3), f"Expected {(bsz, 3)}, got {tuple(val_output.shape)}"
+        output, val_output = self.classifier(fused)
 
-        probs = torch.exp(output)  # (B, C) -> (B, C)
-        confidence_vec = probs.max(dim=1).values  # (B, C) -> (B,)
+        probs = torch.exp(output)
+        confidence_vec = probs.max(dim=1).values
         confidence = confidence_vec.squeeze(0) if confidence_vec.numel() == 1 else confidence_vec
 
         return output, val_output, confidence
