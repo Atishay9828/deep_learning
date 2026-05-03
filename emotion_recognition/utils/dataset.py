@@ -247,8 +247,8 @@ def scan_video_samples(video_root: str | Path) -> List[ClipSample]:
         if emotion_code not in EMOTION_TO_ID:
             continue
 
-        ad_code = normalize_ad_code(rel_parts[-3])
-        participant_id = normalize_subject_id(rel_parts[-4])
+        ad_code = normalize_ad_code(rel_parts[-4])
+        participant_id = normalize_subject_id(rel_parts[-3])
         category = rel_parts[-5] if len(rel_parts) >= 5 else "UNSPECIFIED"
 
         samples.append(
